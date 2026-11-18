@@ -57,67 +57,97 @@ def _random_suffix(length=6):
     return "".join(secrets.choice(alphabet) for _ in range(length))
 
 
-def _find_media(node, found):
-    """Recursively walk Pinterest's embedded JSON looking for images/videos."""
+def _normalize_key(url):
+    """Collapse any pinimg URL to one identity key (ignore size variant)."""
+    if not url: return ""
+    url = re.sub(r"(i\.pinimg\.com/)(?:\d+x\d*|originals)/", r"\1_/", url)
+    return url.split("?")[0]
+
+
+# ============================================================
+#  RECURSIVE COLLECTOR  (replaces the old _find_media)
+# ============================================================
+def _collect_media(node, out):
+    """
+    Walk Pinterest's embedded JSON and collect EVERY image & video
+    in document order (matches what the user sees in the pin).
+    """
     if isinstance(node, dict):
-        # ---- videos ----
+        # ---------- videos ----------
         v = node.get("videos")
         if isinstance(v, dict) and isinstance(v.get("video_list"), dict):
+            best = None
             for item in v["video_list"].values():
-                if not isinstance(item, dict): continue
+                if not isinstance(item, dict):
+                    continue
                 u = _clean(item.get("url") or "")
-                if not u.lower().endswith(".mp4"): continue
-                if _area(item) >= _area(found.get("video", {})):
-                    found["video"] = {"url": u,
-                                      "width": item.get("width"),
-                                      "height": item.get("height")}
+                if not u.lower().endswith(".mp4"):
+                    continue
+                if best is None or _area(item) > _area(best):
+                    best = {"url": u,
+                            "width": item.get("width"),
+                            "height": item.get("height")}
+            if best:
+                out.append({"type": "video", **best})
 
-        # ---- images ----
+        # ---------- images ----------
         imgs = node.get("images")
         if isinstance(imgs, dict):
             for key in ("orig", "originals"):
                 img = imgs.get(key)
                 if isinstance(img, dict) and img.get("url"):
-                    if _area(img) >= _area(found.get("image", {})):
-                        found["image"] = {"url": _upgrade_image(img["url"]),
-                                          "width": img.get("width"),
-                                          "height": img.get("height")}
+                    out.append({"type": "image",
+                                "url": _upgrade_image(img["url"]),
+                                "width": img.get("width"),
+                                "height": img.get("height")})
+                    break
 
         for val in node.values():
-            _find_media(val, found)
+            _collect_media(val, out)
 
     elif isinstance(node, list):
         for item in node:
-            _find_media(item, found)
+            _collect_media(item, out)
+
+
+def _dedupe(items):
+    """Collapse Pinterest's repeated embeds (story/pin/rich_metadata copies)."""
+    seen, result = set(), []
+    for it in items:
+        key = _normalize_key(it["url"])
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(it)
+    return result
 
 
 # ============================================================
 #  EXTRACTION
 # ============================================================
 def extract_media(url):
-    # --- Direct media link pasted in (i.pinimg.com/....jpg or ....mp4) ---
+    # ---------- Direct media URL pasted in ----------
     if DIRECT_MEDIA_RE.search(url):
         if VIDEO_EXT_RE.search(url):
-            return {
-                "success": True,
-                "type": "video",
-                "title": "Pinterest Video",
-                "media": url,
-                "thumbnail": None,
-                "thumbnail_small": None,
-            }
-        full = _upgrade_image(url)
+            item = {"type": "video", "url": _clean(url), "index": 0,
+                    "thumbnail_small": None}
+        else:
+            full = _upgrade_image(url)
+            item = {"type": "image", "url": full, "index": 0,
+                    "thumbnail": _thumb_from_image(url, "564x"),
+                    "thumbnail_small": _thumb_from_image(url, "236x")}
         return {
             "success": True,
-            "type": "image",
-            "title": "Pinterest Image",
-            "media": full,
-            "thumbnail": _thumb_from_image(url, "564x"),
-            "thumbnail_small": _thumb_from_image(url, "236x"),
+            "type": item["type"],
+            "title": "Pinterest Media",
+            "media": item["url"],          # legacy field
+            "media_items": [item],
+            "is_multi": False,
+            "count": 1,
         }
 
-    # --- Normal Pinterest page ---
-    r = SESSION.get(url, timeout=20, allow_redirects=True)
+    # ---------- Normal Pinterest page ----------
+    r = SESSION.get(url, timeout=30, allow_redirects=True)
     r.raise_for_status()
     r.encoding = r.apparent_encoding or "utf-8"
     html = r.text
@@ -126,63 +156,72 @@ def extract_media(url):
     title = (soup.title.string.strip() if (soup.title and soup.title.string)
              else "Pinterest Download")
 
-    found = {}
+    items = []
 
-    # 1) Preferred: parse __PWS_DATA__ JSON (has orig image + mp4 list)
+    # 1) Preferred: full __PWS_DATA__ walk
     script = soup.find("script", id="__PWS_DATA__")
     if script and script.string:
         try:
-            _find_media(json.loads(script.string), found)
+            _collect_media(json.loads(script.string), items)
         except Exception:
             pass
 
-    # 2) Fallback: regex the raw HTML for an mp4
-    if "video" not in found:
-        m = re.search(r'"(?:contentUrl|url)"\s*:\s*"(https:[^"]+?\.mp4[^"]*)"', html)
-        if m:
-            found["video"] = {"url": _clean(m.group(1))}
+    # 2) Fallback: every mp4 found in raw HTML
+    if not any(i["type"] == "video" for i in items):
+        for m in re.finditer(
+            r'"(?:contentUrl|url)"\s*:\s*"(https:[^"]+?\.mp4[^"]*)"', html
+        ):
+            items.append({"type": "video", "url": _clean(m.group(1))})
 
-    # 3) Fallback: og:image meta (both attribute orders)
-    if "image" not in found:
+    # 3) Fallback: og:image
+    if not any(i["type"] == "image" for i in items):
         m = (re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)', html)
              or re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image', html))
         if m:
-            found["image"] = {"url": _upgrade_image(m.group(1))}
+            items.append({"type": "image", "url": _upgrade_image(m.group(1))})
 
-    # 4) Last resort: any pinimg image URL in the page
-    if "image" not in found:
-        m = re.search(r'https://i\.pinimg\.com/[^"\\\s]+?\.(?:jpe?g|png|webp)', html, re.I)
-        if m:
-            found["image"] = {"url": _upgrade_image(m.group(0))}
+    # 4) Last resort: any pinimg image in the page
+    if not items:
+        for m in re.finditer(
+            r'https://i\.pinimg\.com/(?:originals|\d+x\d*)/[^"\\\s]+?\.(?:jpe?g|png|webp)',
+            html, re.I
+        ):
+            items.append({"type": "image", "url": _upgrade_image(m.group(0))})
 
-    # --- Build response ---
-    if "video" in found:
-        thumb = found.get("image", {}).get("url")
-        return {
-            "success": True,
-            "type": "video",
-            "title": title,
-            "media": found["video"]["url"],
-            "width": found["video"].get("width"),
-            "height": found["video"].get("height"),
-            "thumbnail": thumb,
-            "thumbnail_small": _thumb_from_image(thumb, "236x"),
-        }
+    items = _dedupe(items)
 
-    if "image" in found:
-        full = found["image"]["url"]
-        return {
-            "success": True,
-            "type": "image",
-            "title": title,
-            "media": full,
-            "width": found["image"].get("width"),
-            "height": found["image"].get("height"),
-            "thumbnail": _thumb_from_image(full, "564x"),
-            "thumbnail_small": _thumb_from_image(full, "236x"),
-        }
+    if not items:
+        return {"success": False, "message": "Media not found"}
 
-    return {"success": False, "message": "Media not found"}
+    # ---------- Enrich ----------
+    for idx, it in enumerate(items):
+        it["index"] = idx
+        if it["type"] == "video":
+            thumb = it.get("thumbnail") or it["url"]
+            it.setdefault("thumbnail", _thumb_from_image(thumb, "564x"))
+            it.setdefault("thumbnail_small", _thumb_from_image(thumb, "236x"))
+        else:
+            it.setdefault("thumbnail", _thumb_from_image(it["url"], "564x"))
+            it.setdefault("thumbnail_small", _thumb_from_image(it["url"], "236x"))
+
+    primary = items[0]
+    is_multi = len(items) > 1
+
+    return {
+        "success": True,
+        "type": primary["type"],
+        "title": title,
+        "media": primary["url"],                 # legacy single-field
+        "thumbnail": primary.get("thumbnail"),
+        "thumbnail_small": primary.get("thumbnail_small"),
+        "width": primary.get("width"),
+        "height": primary.get("height"),
+
+        # ---- multi-asset payload ----
+        "is_multi": is_multi,
+        "media_items": items,
+        "count": len(items),
+    }
 
 
 # ============================================================
@@ -205,11 +244,11 @@ def download():
         if not result.get("success"):
             return jsonify(result), 404
 
-        # Optional proxy URL for custom filename / forced CORS.
-        # Prefer using result["media"] directly to save free-tier bandwidth.
-        result["stream_url"] = (
-            f"/api/stream?url={quote(result['media'], safe='')}"
-        )
+        # Attach a ready-to-use stream URL to every item
+        for it in result["media_items"]:
+            it["stream_url"] = f"/api/stream?url={quote(it['url'], safe='')}"
+
+        result["stream_url"] = result["media_items"][0]["stream_url"]
         return jsonify(result)
 
     except requests.exceptions.RequestException as e:
@@ -223,25 +262,22 @@ def stream():
     """
     Zero-storage, resumable proxy.
 
-    * Forwards the client's `Range` header straight to Pinterest.
-    * Returns Pinterest's `206 Partial Content` + `Content-Range` verbatim.
-    * Uses no disk and no in-memory cache.
-    * Every download gets a unique branded filename:
-        toolifyx.netlify_<random6>.<ext>
-      so no "file already exists" prompts and every file carries the site name.
+    * Forwards client's `Range` header straight to Pinterest.
+    * Returns Pinterest's 206 + Content-Range verbatim.
+    * No disk, no in-memory cache.
+    * Branded unique filename: toolifyx.netlify_<random6>.<ext>
     """
     target = request.args.get("url", "").strip()
     if not target:
         return jsonify({"success": False, "message": "No URL"}), 400
 
-    # If a pin page URL was passed, resolve to direct media first.
+    # If a pin page URL was passed, resolve to direct media.
     if re.search(r"(pinterest\.[a-z.]+/pin/|pin\.it/)", target, re.I):
         r = extract_media(target)
         if not r.get("success"):
             return jsonify({"success": False, "message": r.get("message")}), 400
         target = r["media"]
 
-    # Forward Range — the whole point of this endpoint.
     fwd = {"Accept-Encoding": "identity"}
     if request.headers.get("Range"):
         fwd["Range"] = request.headers["Range"]
@@ -252,7 +288,6 @@ def stream():
     except requests.exceptions.RequestException as e:
         return jsonify({"success": False, "message": str(e)}), 502
 
-    # Pass through status (200 or 206) and key headers.
     headers = {
         "Content-Type": upstream.headers.get("Content-Type", "application/octet-stream"),
         "Accept-Ranges": "bytes",
@@ -262,13 +297,11 @@ def stream():
         if h in upstream.headers:
             headers[h] = upstream.headers[h]
 
-    is_video = VIDEO_EXT_RE.search(target) or \
+    is_video = bool(VIDEO_EXT_RE.search(target)) or \
                upstream.headers.get("Content-Type", "").startswith("video/")
     ext = "mp4" if is_video else "jpg"
 
-    # --- BRANDED UNIQUE FILENAME: toolifyx.netlify_<random6>.<ext> ---
     unique_name = f"toolifyx.netlify_{_random_suffix(6)}.{ext}"
-
     headers["Content-Disposition"] = f'attachment; filename="{unique_name}"'
 
     if request.method == "HEAD":
